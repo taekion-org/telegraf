@@ -20,7 +20,16 @@ type SystemdUnits struct {
 	systemctl systemctl
 }
 
-type systemctl func(Timeout internal.Duration, UnitType string) (*bytes.Buffer, error)
+type SystemdData struct {
+	name   string
+	state  string
+	load   string
+	active string
+	sub    string
+	fields map[string]interface{}
+}
+
+type systemctl func(Timeout internal.Duration, UnitType string, InterfaceType string) (*bytes.Buffer, error)
 
 const measurement = "systemd_units"
 
@@ -35,6 +44,7 @@ var load_map = map[string]int{
 	"error":       4,
 	"merged":      5,
 	"masked":      6,
+	"null":        10,
 }
 
 var active_map = map[string]int{
@@ -44,6 +54,19 @@ var active_map = map[string]int{
 	"failed":       3,
 	"activating":   4,
 	"deactivating": 5,
+	"null":         10,
+}
+
+var files_map = map[string]int{
+	"disabled":        0,
+	"enabled":         1,
+	"enabled-runtime": 2,
+	"generated":       3,
+	"indirect":        4,
+	"masked":          5,
+	"static":          6,
+	"transient":       7,
+	"null":            10,
 }
 
 var sub_map = map[string]int{
@@ -109,6 +132,7 @@ var sub_map = map[string]int{
 
 	// timer_state_table, offset 0x00a0
 	"elapsed": 0x00a0,
+	"null":    0x00ff,
 }
 
 var (
@@ -136,9 +160,37 @@ func (s *SystemdUnits) SampleConfig() string {
 
 // Gather parses systemctl outputs and adds counters to the Accumulator
 func (s *SystemdUnits) Gather(acc telegraf.Accumulator) error {
-	out, err := s.systemctl(s.Timeout, s.UnitType)
+	out, err := s.systemctl(s.Timeout, s.UnitType, "list-units")
 	if err != nil {
 		return err
+	}
+
+	var out2 *bytes.Buffer
+	out2, err = s.systemctl(s.Timeout, s.UnitType, "list-unit-files")
+	if err != nil {
+		return err
+	}
+
+	tags := make(map[string]*SystemdData)
+	scanner2 := bufio.NewScanner(out2)
+	for scanner2.Scan() {
+		line := scanner2.Text()
+
+		data := strings.Fields(line)
+		if len(data) < 2 {
+			acc.AddError(fmt.Errorf("Error parsing line (expected at least 2 fields): %s", line))
+			continue
+		}
+
+		name := data[0]
+		state := data[1]
+		tags[name] = &SystemdData{
+			name:   name,
+			state:  state,
+			load:   "null",
+			active: "null",
+			sub:    "null",
+		}
 	}
 
 	scanner := bufio.NewScanner(out)
@@ -150,61 +202,98 @@ func (s *SystemdUnits) Gather(acc telegraf.Accumulator) error {
 			acc.AddError(fmt.Errorf("Error parsing line (expected at least 4 fields): %s", line))
 			continue
 		}
+
 		name := data[0]
 		load := data[1]
 		active := data[2]
 		sub := data[3]
-		tags := map[string]string{
-			"name":   name,
-			"load":   load,
-			"active": active,
-			"sub":    sub,
+
+		if load == "" {
+			load = "null"
+		}
+		if active == "" {
+			active = "null"
+		}
+		if sub == "" {
+			sub = "null"
 		}
 
 		var (
-			load_code   int
-			active_code int
-			sub_code    int
-			ok          bool
+			loadCode   int
+			activeCode int
+			subCode    int
+			filesCode  int
+			ok         bool
 		)
-		if load_code, ok = load_map[load]; !ok {
+
+		if loadCode, ok = load_map[load]; !ok {
 			acc.AddError(fmt.Errorf("Error parsing field 'load', value not in map: %s", load))
 			continue
 		}
-		if active_code, ok = active_map[active]; !ok {
+		if activeCode, ok = active_map[active]; !ok {
 			acc.AddError(fmt.Errorf("Error parsing field 'active', value not in map: %s", active))
 			continue
 		}
-		if sub_code, ok = sub_map[sub]; !ok {
+		if subCode, ok = sub_map[sub]; !ok {
 			acc.AddError(fmt.Errorf("Error parsing field 'sub', value not in map: %s", sub))
 			continue
 		}
-		fields := map[string]interface{}{
-			"load_code":   load_code,
-			"active_code": active_code,
-			"sub_code":    sub_code,
+		if _, ok = tags[name]; ok {
+			if filesCode, ok = files_map[tags[name].state]; !ok {
+				acc.AddError(fmt.Errorf("Error parsing field 'state', %s value not in map: %s", name))
+				continue
+			}
 		}
 
-		acc.AddFields(measurement, fields, tags)
-	}
+		fields := map[string]interface{}{
+			"load_code":   loadCode,
+			"active_code": activeCode,
+			"sub_code":    subCode,
+			"state_code":  filesCode,
+		}
 
+		if _, ok = tags[name]; !ok || tags[name].state == "" {
+			tags[name] = &SystemdData{
+				name:   name,
+				state:  "null",
+				load:   load,
+				active: active,
+				sub:    sub,
+				fields: fields,
+			}
+		} else {
+			tags[name] = &SystemdData{
+				name:   name,
+				state:  tags[name].state,
+				load:   load,
+				active: active,
+				sub:    sub,
+				fields: fields,
+			}
+		}
+
+		for _, data := range tags {
+			acc.AddFields(measurement, data.fields, map[string]string{"name": data.name, "state": data.state, "load": data.load, "sub": data.sub}, time.Now())
+		}
+
+	}
 	return nil
 }
 
-func setSystemctl(Timeout internal.Duration, UnitType string) (*bytes.Buffer, error) {
+func setSystemctl(Timeout internal.Duration, UnitType string, InterfaceType string) (*bytes.Buffer, error) {
 	// is systemctl available ?
 	systemctlPath, err := exec.LookPath("systemctl")
 	if err != nil {
 		return nil, err
 	}
 
-	cmd := exec.Command(systemctlPath, "list-units", "--all", fmt.Sprintf("--type=%s", UnitType), "--no-legend")
+	cmd := exec.Command(systemctlPath, InterfaceType, "--all", fmt.Sprintf("--type=%s", UnitType), "--no-legend")
 
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	err = internal.RunTimeout(cmd, Timeout.Duration)
 	if err != nil {
-		return &out, fmt.Errorf("error running systemctl list-units --all --type=%s --no-legend: %s", UnitType, err)
+		return &out, fmt.Errorf("error running systemctl %s --all --type=%s --no-legend: %s", InterfaceType, UnitType, err)
 	}
 
 	return &out, nil
